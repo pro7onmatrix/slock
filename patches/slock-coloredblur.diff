@@ -1,0 +1,201 @@
+diff --git a/config.def.h b/config.def.h
+index 9855e21..833af7f 100644
+--- a/config.def.h
++++ b/config.def.h
+@@ -1,12 +1,16 @@
+ /* user and group to drop privileges to */
+ static const char *user  = "nobody";
+-static const char *group = "nogroup";
++static const char *group = "nobody";
+ 
+ static const char *colorname[NUMCOLS] = {
+-	[INIT] =   "black",     /* after initialization */
+-	[INPUT] =  "#005577",   /* during input */
+-	[FAILED] = "#CC3333",   /* wrong password */
++	[INIT]   = "#FFFFFF",   /* after initialization and cleared pw */
++	[INPUT]  = "#00B6FF",   /* during input */
++	[FAILED] = "#FF4040",   /* wrong password */
+ };
+ 
+ /* treat a cleared input like a wrong password (color) */
+-static const int failonclear = 1;
++static const int failonclear = 0;
++
++static const int blurradius = 30;
++
++#define CPU_THREADS 4
+diff --git a/config.mk b/config.mk
+index 74429ae..afb1780 100644
+--- a/config.mk
++++ b/config.mk
+@@ -7,8 +7,8 @@ VERSION = 1.4
+ PREFIX = /usr/local
+ MANPREFIX = ${PREFIX}/share/man
+ 
+-X11INC = /usr/X11R6/include
+-X11LIB = /usr/X11R6/lib
++X11INC = /usr/include/X11
++X11LIB = /usr/lib64/X11
+ 
+ # includes and libs
+ INCS = -I. -I/usr/include -I${X11INC}
+@@ -17,7 +17,7 @@ LIBS = -L/usr/lib -lc -lcrypt -L${X11LIB} -lX11 -lXext -lXrandr
+ # flags
+ CPPFLAGS = -DVERSION=\"${VERSION}\" -D_DEFAULT_SOURCE -DHAVE_SHADOW_H
+ CFLAGS = -std=c99 -pedantic -Wall -Os ${INCS} ${CPPFLAGS}
+-LDFLAGS = -s ${LIBS}
++LDFLAGS = -pthread -s ${LIBS}
+ COMPATSRC = explicit_bzero.c
+ 
+ # On OpenBSD and Darwin remove -lcrypt from LIBS
+diff --git a/slock.c b/slock.c
+index 5ae738c..cbe337b 100644
+--- a/slock.c
++++ b/slock.c
+@@ -1,4 +1,5 @@
+ /* See LICENSE file for license details. */
++#include <X11/X.h>
+ #define _XOPEN_SOURCE 500
+ #if HAVE_SHADOW_H
+ #include <shadow.h>
+@@ -18,6 +19,7 @@
+ #include <X11/keysym.h>
+ #include <X11/Xlib.h>
+ #include <X11/Xutil.h>
++#include "stackblur.h"
+ 
+ #include "arg.h"
+ #include "util.h"
+@@ -36,6 +38,7 @@ struct lock {
+ 	Window root, win;
+ 	Pixmap pmap;
+ 	unsigned long colors[NUMCOLS];
++  XImage *image, *originalimage;
+ };
+ 
+ struct xrandr {
+@@ -46,6 +49,51 @@ struct xrandr {
+ 
+ #include "config.h"
+ 
++static void
++blurlockwindow(Display *dpy, struct lock *lock, int color)
++{
++  XWindowAttributes attr;
++  XGetWindowAttributes(dpy, lock->root, &attr);
++
++  unsigned long bytes = sizeof(char) * lock->originalimage->bytes_per_line * lock->originalimage->height;
++
++  // get original image
++  memcpy(lock->image->data, lock->originalimage->data, bytes);
++
++  // blur the image
++  stackblur(lock->image, 0, 0, lock->image->width, lock->image->height, blurradius, CPU_THREADS);
++
++  // tint the image
++  unsigned char r = (lock->colors[color] & lock->image->red_mask) >> 16;
++  unsigned char g = (lock->colors[color] & lock->image->green_mask) >> 8;
++  unsigned char b = (lock->colors[color] & lock->image->blue_mask);
++
++  unsigned long x, y;
++  unsigned long pixel;
++
++  unsigned long pr, pg, pb;
++
++  for (x = 0; x < lock->image->width; x++) {
++    for (y = 0; y < lock->image->height; y++) {
++      pixel = XGetPixel(lock->image, x, y);
++
++      pr = ((pixel & lock->image->red_mask) >> 16) * r / 255;
++      pg = ((pixel & lock->image->green_mask) >> 8) * g / 255;
++      pb = (pixel & lock->image->blue_mask) * b / 255;
++
++      pixel = pr << 16 | pg << 8 | pb;
++
++      XPutPixel(lock->image, x, y, pixel);
++    }
++  }
++
++  XMapRaised(dpy, lock->win);
++  GC gc = XCreateGC(dpy, lock->win, 0, 0);
++  XPutImage(dpy, lock->win, gc, lock->image, 0, 0, 0, 0, attr.width, attr.height);
++  XFlush(dpy);
++  XFreeGC(dpy, gc);
++}
++
+ static void
+ die(const char *errstr, ...)
+ {
+@@ -137,10 +185,11 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
+ 
+ 	len = 0;
+ 	running = 1;
+-	failure = 0;
+ 	oldc = INIT;
+ 
+ 	while (running && !XNextEvent(dpy, &ev)) {
++    failure = 0;
++
+ 		if (ev.type == KeyPress) {
+ 			explicit_bzero(&buf, sizeof(buf));
+ 			num = XLookupString(&ev.xkey, buf, sizeof(buf), &ksym, 0);
+@@ -189,12 +238,8 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
+ 			}
+ 			color = len ? INPUT : ((failure || failonclear) ? FAILED : INIT);
+ 			if (running && oldc != color) {
+-				for (screen = 0; screen < nscreens; screen++) {
+-					XSetWindowBackground(dpy,
+-					                     locks[screen]->win,
+-					                     locks[screen]->colors[color]);
+-					XClearWindow(dpy, locks[screen]->win);
+-				}
++				for (screen = 0; screen < nscreens; screen++)
++          blurlockwindow(dpy, locks[screen], color);
+ 				oldc = color;
+ 			}
+ 		} else if (rr->active && ev.type == rr->evbase + RRScreenChangeNotify) {
+@@ -208,6 +253,7 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
+ 					else
+ 						XResizeWindow(dpy, locks[screen]->win,
+ 						              rre->width, rre->height);
++          blurlockwindow(dpy, locks[screen], INIT);
+ 					XClearWindow(dpy, locks[screen]->win);
+ 					break;
+ 				}
+@@ -256,6 +302,14 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
+ 	                                &color, &color, 0, 0);
+ 	XDefineCursor(dpy, lock->win, invisible);
+ 
++  XWindowAttributes attr;
++  XGetWindowAttributes(dpy, lock->root, &attr);
++  lock->originalimage = XGetImage(dpy, lock->root, attr.x, attr.y, attr.width, attr.height, AllPlanes, ZPixmap);
++  lock->image = malloc(sizeof(XImage));
++  memcpy(lock->image, lock->originalimage, sizeof(XImage));
++  lock->image->data = malloc(sizeof(char) * lock->image->bytes_per_line * lock->image->height);
++  blurlockwindow(dpy, lock, INIT);
++
+ 	/* Try to grab mouse pointer *and* keyboard for 600ms, else fail the lock */
+ 	for (i = 0, ptgrab = kbgrab = -1; i < 6; i++) {
+ 		if (ptgrab != GrabSuccess) {
+@@ -365,7 +419,7 @@ main(int argc, char **argv) {
+ 	for (nlocks = 0, s = 0; s < nscreens; s++) {
+ 		if ((locks[s] = lockscreen(dpy, &rr, s)) != NULL)
+ 			nlocks++;
+-		else
++    else
+ 			break;
+ 	}
+ 	XSync(dpy, 0);
+diff --git a/Makefile b/Makefile
+index f4ffbb7..9bcabc1 100644
+--- a/Makefile
++++ b/Makefile
+@@ -3,7 +3,7 @@
+ 
+ include config.mk
+ 
+-SRC = slock.c ${COMPATSRC}
++SRC = slock.c stackblur.c ${COMPATSRC}
+ OBJ = ${SRC:.c=.o}
+ 
+ all: options slock

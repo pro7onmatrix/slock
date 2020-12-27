@@ -1,4 +1,5 @@
 /* See LICENSE file for license details. */
+#include <X11/X.h>
 #define _XOPEN_SOURCE 500
 #if HAVE_SHADOW_H
 #include <shadow.h>
@@ -18,6 +19,7 @@
 #include <X11/keysym.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include "stackblur.h"
 
 #include "arg.h"
 #include "util.h"
@@ -36,6 +38,7 @@ struct lock {
 	Window root, win;
 	Pixmap pmap;
 	unsigned long colors[NUMCOLS];
+  XImage *image, *originalimage;
 };
 
 struct xrandr {
@@ -45,6 +48,51 @@ struct xrandr {
 };
 
 #include "config.h"
+
+static void
+blurlockwindow(Display *dpy, struct lock *lock, int color)
+{
+  XWindowAttributes attr;
+  XGetWindowAttributes(dpy, lock->root, &attr);
+
+  unsigned long bytes = sizeof(char) * lock->originalimage->bytes_per_line * lock->originalimage->height;
+
+  // get original image
+  memcpy(lock->image->data, lock->originalimage->data, bytes);
+
+  // blur the image
+  stackblur(lock->image, 0, 0, lock->image->width, lock->image->height, blurradius, CPU_THREADS);
+
+  // tint the image
+  unsigned char r = (lock->colors[color] & lock->image->red_mask) >> 16;
+  unsigned char g = (lock->colors[color] & lock->image->green_mask) >> 8;
+  unsigned char b = (lock->colors[color] & lock->image->blue_mask);
+
+  unsigned long x, y;
+  unsigned long pixel;
+
+  unsigned long pr, pg, pb;
+
+  for (x = 0; x < lock->image->width; x++) {
+    for (y = 0; y < lock->image->height; y++) {
+      pixel = XGetPixel(lock->image, x, y);
+
+      pr = ((pixel & lock->image->red_mask) >> 16) * r / 255;
+      pg = ((pixel & lock->image->green_mask) >> 8) * g / 255;
+      pb = (pixel & lock->image->blue_mask) * b / 255;
+
+      pixel = pr << 16 | pg << 8 | pb;
+
+      XPutPixel(lock->image, x, y, pixel);
+    }
+  }
+
+  XMapRaised(dpy, lock->win);
+  GC gc = XCreateGC(dpy, lock->win, 0, 0);
+  XPutImage(dpy, lock->win, gc, lock->image, 0, 0, 0, 0, attr.width, attr.height);
+  XFlush(dpy);
+  XFreeGC(dpy, gc);
+}
 
 static void
 die(const char *errstr, ...)
@@ -137,10 +185,11 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 
 	len = 0;
 	running = 1;
-	failure = 0;
 	oldc = INIT;
 
 	while (running && !XNextEvent(dpy, &ev)) {
+    failure = 0;
+
 		if (ev.type == KeyPress) {
 			explicit_bzero(&buf, sizeof(buf));
 			num = XLookupString(&ev.xkey, buf, sizeof(buf), &ksym, 0);
@@ -189,12 +238,8 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 			}
 			color = len ? INPUT : ((failure || failonclear) ? FAILED : INIT);
 			if (running && oldc != color) {
-				for (screen = 0; screen < nscreens; screen++) {
-					XSetWindowBackground(dpy,
-					                     locks[screen]->win,
-					                     locks[screen]->colors[color]);
-					XClearWindow(dpy, locks[screen]->win);
-				}
+				for (screen = 0; screen < nscreens; screen++)
+          blurlockwindow(dpy, locks[screen], color);
 				oldc = color;
 			}
 		} else if (rr->active && ev.type == rr->evbase + RRScreenChangeNotify) {
@@ -208,6 +253,7 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 					else
 						XResizeWindow(dpy, locks[screen]->win,
 						              rre->width, rre->height);
+          blurlockwindow(dpy, locks[screen], INIT);
 					XClearWindow(dpy, locks[screen]->win);
 					break;
 				}
@@ -255,6 +301,14 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 	invisible = XCreatePixmapCursor(dpy, lock->pmap, lock->pmap,
 	                                &color, &color, 0, 0);
 	XDefineCursor(dpy, lock->win, invisible);
+
+  XWindowAttributes attr;
+  XGetWindowAttributes(dpy, lock->root, &attr);
+  lock->originalimage = XGetImage(dpy, lock->root, attr.x, attr.y, attr.width, attr.height, AllPlanes, ZPixmap);
+  lock->image = malloc(sizeof(XImage));
+  memcpy(lock->image, lock->originalimage, sizeof(XImage));
+  lock->image->data = malloc(sizeof(char) * lock->image->bytes_per_line * lock->image->height);
+  blurlockwindow(dpy, lock, INIT);
 
 	/* Try to grab mouse pointer *and* keyboard for 600ms, else fail the lock */
 	for (i = 0, ptgrab = kbgrab = -1; i < 6; i++) {
@@ -365,7 +419,7 @@ main(int argc, char **argv) {
 	for (nlocks = 0, s = 0; s < nscreens; s++) {
 		if ((locks[s] = lockscreen(dpy, &rr, s)) != NULL)
 			nlocks++;
-		else
+    else
 			break;
 	}
 	XSync(dpy, 0);
