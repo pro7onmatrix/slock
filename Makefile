@@ -3,7 +3,7 @@
 
 include config.mk
 
-SRC = slock.c ${COMPATSRC}
+SRC = slock.c stackblur.c ${COMPATSRC}
 OBJ = ${SRC:.c=.o}
 
 all: options slock
