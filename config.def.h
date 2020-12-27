@@ -13,3 +13,6 @@ static const int failonclear = 1;
 
 /* time in seconds before the monitor shuts down */
 static const int monitortime = 10;
+
+/* allow control key to trigger fail on clear */
+static const int controlkeyclear = 0;
