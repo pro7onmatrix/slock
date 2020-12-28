@@ -1,7 +1,6 @@
 /* See LICENSE file for license details. */
 #include <X11/X.h>
 #include <pthread.h>
-#include <time.h>
 #define _XOPEN_SOURCE 500
 #if HAVE_SHADOW_H
 #include <shadow.h>
@@ -18,8 +17,6 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <X11/extensions/Xrandr.h>
-#include <X11/extensions/Xinerama.h>
-#include <X11/extensions/dpms.h>
 #include <X11/keysym.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -45,19 +42,10 @@ struct lock {
   XImage *image, *originalimage;
 };
 
-struct TintThreadParams {
+struct tintThreadParams {
   int tid; // Thread-ID
   unsigned char tr, tg, tb; // Tinting RGB values
   XImage *image; // Pointer to image
-};
-
-struct TimeThreadParams {
-  Display *dpy;
-  struct lock *lock;
-  struct tm *current_time;
-  pthread_mutex_t *mutex;
-  pthread_cond_t *cond;
-  int exit;
 };
 
 struct xrandr {
@@ -69,9 +57,9 @@ struct xrandr {
 #include "config.h"
 
 static void *
-tintline(void *args)
+tintLine(void *args)
 {
-  struct TintThreadParams *params = (struct TintThreadParams *) args;
+  struct tintThreadParams *params = (struct tintThreadParams *) args;
 
   unsigned long x, y;
   unsigned long pixel;
@@ -98,6 +86,9 @@ tintline(void *args)
 static void
 blurlockwindow(Display *dpy, struct lock *lock, int color)
 {
+  XWindowAttributes attr;
+  XGetWindowAttributes(dpy, lock->root, &attr);
+
   // get original image
   memcpy(lock->image->data, lock->originalimage->data, sizeof(char) * lock->originalimage->bytes_per_line * lock->originalimage->height);
 
@@ -106,8 +97,8 @@ blurlockwindow(Display *dpy, struct lock *lock, int color)
   unsigned char tg = (lock->colors[color] & lock->image->green_mask) >> 8;
   unsigned char tb = (lock->colors[color] & lock->image->blue_mask);
 
-  pthread_t *tint_threads = malloc(CPU_THREADS * sizeof(pthread_t));
-  struct TintThreadParams *tintparams = malloc(CPU_THREADS * sizeof(struct TintThreadParams));
+  pthread_t *tid = malloc(CPU_THREADS * sizeof(pthread_t));
+  struct tintThreadParams *tintparams = malloc(CPU_THREADS * sizeof(struct tintThreadParams));
 
   int i;
 
@@ -118,106 +109,20 @@ blurlockwindow(Display *dpy, struct lock *lock, int color)
     tintparams[i].tb = tb;
     tintparams[i].image = lock->image;
 
-    pthread_create(&tint_threads[i], NULL, tintline, &tintparams[i]);
+    pthread_create(&tid[i], NULL, tintLine, &tintparams[i]);
   }
 
   for (i = 0; i < CPU_THREADS; i++)
-    pthread_join(tint_threads[i], NULL);
+    pthread_join(tid[i], NULL);
 
-  free(tint_threads);
+  free(tid);
   free(tintparams);
-}
 
-static void
-displayimagetime(Display *dpy, struct lock *lock, struct tm *time)
-{
-  int len, width, height, s_width, s_height, i;
-  XGCValues gr_values;
-  XFontStruct *fontinfo;
-  XColor color, dummy;
-  XineramaScreenInfo *xsi;
-  GC gc;
-
-  fontinfo = XLoadQueryFont(dpy, font_name);
-
-  XAllocNamedColor(dpy, DefaultColormap(dpy, lock->screen),
-     text_color, &color, &dummy);
-
-  gr_values.font = fontinfo->fid;
-  gr_values.foreground = color.pixel;
-  gc = XCreateGC(dpy, lock->win, GCFont + GCForeground, &gr_values);
-
-  XWindowAttributes attr;
-  XGetWindowAttributes(dpy, lock->root, &attr);
-
+  XMapRaised(dpy, lock->win);
+  GC gc = XCreateGC(dpy, lock->win, 0, 0);
   XPutImage(dpy, lock->win, gc, lock->image, 0, 0, 0, 0, attr.width, attr.height);
-
-  /*  To prevent "Uninitialized" warnings. */
-  xsi = NULL;
-
-  /* Start formatting and drawing text */
-  char message[32];
-  sprintf(message, "%02d:%02d:%02d", time->tm_hour, time->tm_min, time->tm_sec);
-  len = strlen(message);
-
-  if (XineramaIsActive(dpy)) {
-    xsi = XineramaQueryScreens(dpy, &i);
-    s_width = xsi[0].width;
-    s_height = xsi[0].height;
-  } else {
-    s_width = DisplayWidth(dpy, lock->screen);
-    s_height = DisplayHeight(dpy, lock->screen);
-  }
-
-  height = s_height / 2;
-  width  = (s_width - XTextWidth(fontinfo, message, len)) / 2;
-
-  XDrawString(dpy, lock->win, gc, width, height, message, len);
-
-  /* xsi should not be NULL anyway if Xinerama is active, but to be safe */
-  if (XineramaIsActive(dpy) && xsi != NULL)
-    XFree(xsi);
-
   XFlush(dpy);
   XFreeGC(dpy, gc);
-}
-
-static void *
-updatetime(void *args)
-{
-  struct TimeThreadParams *params = (struct TimeThreadParams *) args;
-
-  time_t rawtime;
-
-  // for pthread_cond_timedwait
-  struct timespec timeout;
-  clock_gettime(CLOCK_MONOTONIC, &timeout);
-
-  XEvent e;
-
-  pthread_mutex_lock(params->mutex);
-
-  while (!params->exit) {
-    timeout.tv_sec += 1;
-
-    // get current time
-    time(&rawtime);
-    localtime_r(&rawtime, params->current_time);
-
-    // send Expose event
-    memset(&e, 0, sizeof(XEvent));
-    e.type = Expose;
-    e.xexpose.window = params->lock->win;
-    XSendEvent(params->dpy, params->lock->win, 0, ExposureMask, &e);
-    XFlush(params->dpy);
-
-    // sleep for 1 second
-    pthread_cond_timedwait(params->cond, params->mutex, &timeout);
-  }
-
-  pthread_mutex_unlock(params->mutex);
-  printf("Exiting...\n");
-  pthread_exit(NULL);
 }
 
 static void
@@ -313,33 +218,6 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
   running = 1;
   oldc = INIT;
 
-  XSelectInput(dpy, locks[0]->win, KeyPressMask | ExposureMask);
-
-  struct tm *current_time = malloc(sizeof(struct tm));
-
-  pthread_mutex_t mutex;
-  pthread_mutex_init(&mutex, NULL);
-
-  pthread_cond_t cond;
-  pthread_condattr_t condattr;
-  pthread_condattr_init(&condattr);
-  pthread_condattr_setclock(&condattr, CLOCK_MONOTONIC);
-  pthread_cond_init(&cond, &condattr);
-
-  struct TimeThreadParams *ttparams = malloc(sizeof(struct TimeThreadParams));
-  ttparams->dpy = dpy;
-  ttparams->lock = locks[0];
-  ttparams->mutex = &mutex;
-  ttparams->cond = &cond;
-  ttparams->current_time = current_time;
-  ttparams->exit = 0;
-
-  pthread_t time_thread;
-  pthread_create(&time_thread, NULL, updatetime, ttparams);
-
-  for (screen = 0; screen < nscreens; screen++)
-    displayimagetime(dpy, locks[screen], current_time);
-
   while (running && !XNextEvent(dpy, &ev)) {
     failure = 0;
 
@@ -382,9 +260,8 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
           passwd[--len] = '\0';
         break;
       default:
-        if (controlkeyclear && iscntrl((int)buf[0]))
-          continue;
-        if (num && (len + num < sizeof(passwd))) {
+        if (num && !iscntrl((int)buf[0]) &&
+            (len + num < sizeof(passwd))) {
           memcpy(passwd + len, buf, num);
           len += num;
         }
@@ -392,14 +269,10 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
       }
       color = len ? INPUT : ((failure || failonclear) ? FAILED : INIT);
       if (running && oldc != color) {
-        for (screen = 0; screen < nscreens; screen++) {
+        for (screen = 0; screen < nscreens; screen++)
           blurlockwindow(dpy, locks[screen], color);
-          displayimagetime(dpy, locks[screen], current_time);
-        }
         oldc = color;
       }
-    } else if (ev.type == Expose) {
-      displayimagetime(dpy, locks[0], current_time);
     } else if (rr->active && ev.type == rr->evbase + RRScreenChangeNotify) {
       rre = (XRRScreenChangeNotifyEvent*)&ev;
       for (screen = 0; screen < nscreens; screen++) {
@@ -412,7 +285,6 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
             XResizeWindow(dpy, locks[screen]->win,
                           rre->width, rre->height);
           blurlockwindow(dpy, locks[screen], INIT);
-          displayimagetime(dpy, locks[screen], current_time);
           XClearWindow(dpy, locks[screen]->win);
           break;
         }
@@ -422,13 +294,6 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
         XRaiseWindow(dpy, locks[screen]->win);
     }
   }
-
-  ttparams->exit = 1;
-  pthread_cond_signal(ttparams->cond);
-  pthread_join(time_thread, NULL);
-
-  free(current_time);
-  free(ttparams);
 }
 
 static struct lock *
@@ -536,7 +401,6 @@ main(int argc, char **argv) {
   const char *hash;
   Display *dpy;
   int s, nlocks, nscreens;
-  CARD16 standby, suspend, off;
 
   ARGBEGIN {
   case 'v':
@@ -597,20 +461,6 @@ main(int argc, char **argv) {
   if (nlocks != nscreens)
     return 1;
 
-  /* DPMS magic to disable the monitor */
-  if (!DPMSCapable(dpy))
-    die("slock: DPMSCapable failed\n");
-  if (!DPMSEnable(dpy))
-    die("slock: DPMSEnable failed\n");
-  if (!DPMSGetTimeouts(dpy, &standby, &suspend, &off))
-    die("slock: DPMSGetTimeouts failed\n");
-  if (!standby || !suspend || !off)
-    die("slock: at least one DPMS variable is zero\n");
-  if (!DPMSSetTimeouts(dpy, monitortime, monitortime, monitortime))
-    die("slock: DPMSSetTimeouts failed\n");
-
-  XSync(dpy, 0);
-
   /* run post-lock command */
   if (argc > 0) {
     switch (fork()) {
@@ -627,10 +477,6 @@ main(int argc, char **argv) {
 
   /* everything is now blank. Wait for the correct password */
   readpw(dpy, &rr, locks, nscreens, hash);
-
-  /* reset DPMS values to inital ones */
-  DPMSSetTimeouts(dpy, standby, suspend, off);
-  XSync(dpy, 0);
 
   return 0;
 }
