@@ -21,3 +21,6 @@ static const int controlkeyclear = 0;
 static const int blurradius = 30;
 
 #define CPU_THREADS 4
+
+static const char *font_name  = "-adobe-courier-bold-r-normal--34-240-100-100-m-200-iso8859-1";
+static const char *text_color = "#ffffff";
