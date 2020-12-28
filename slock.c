@@ -214,7 +214,6 @@ updatetime(void *args)
   }
 
   pthread_mutex_unlock(params->mutex);
-  printf("Exiting...\n");
   pthread_exit(NULL);
 }
 
