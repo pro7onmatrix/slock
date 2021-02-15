@@ -53,7 +53,6 @@ struct TintThreadParams {
 struct TimeThreadParams {
   Display *dpy;
   struct lock *lock;
-  struct tm *current_time;
   pthread_mutex_t *mutex;
   pthread_cond_t *cond;
   int exit;
@@ -98,7 +97,7 @@ static void
 blurlockwindow(Display *dpy, struct lock *lock, int color)
 {
   // get original image
-  memcpy(lock->image->data, lock->originalimage->data, sizeof(char) * lock->originalimage->bytes_per_line * lock->originalimage->height);
+  memcpy(lock->image->data, lock->originalimage->data, sizeof(char) * lock->image->bytes_per_line * lock->image->height);
 
   // tint the image
   unsigned char tr = (lock->colors[color] & lock->image->red_mask) >> 16;
@@ -128,94 +127,15 @@ blurlockwindow(Display *dpy, struct lock *lock, int color)
 }
 
 static void
-displayimagetime(Display *dpy, struct lock *lock, struct tm *time)
+displayimage(Display *dpy, struct lock *lock)
 {
-  int len, width, height, s_width, s_height, i;
-  XGCValues gr_values;
-  XFontStruct *fontinfo;
-  XColor color, dummy;
-  XineramaScreenInfo *xsi;
-  GC gc;
+  GC gc = XCreateGC(dpy, lock->win, 0, 0);
 
-  fontinfo = XLoadQueryFont(dpy, font_name);
-
-  XAllocNamedColor(dpy, DefaultColormap(dpy, lock->screen),
-     text_color, &color, &dummy);
-
-  gr_values.font = fontinfo->fid;
-  gr_values.foreground = color.pixel;
-  gc = XCreateGC(dpy, lock->win, GCFont + GCForeground, &gr_values);
-
-  XWindowAttributes attr;
-  XGetWindowAttributes(dpy, lock->root, &attr);
-
-  XPutImage(dpy, lock->win, gc, lock->image, 0, 0, 0, 0, attr.width, attr.height);
-
-  /*  To prevent "Uninitialized" warnings. */
-  xsi = NULL;
-
-  /* Start formatting and drawing text */
-  char message[32];
-  sprintf(message, "%02d:%02d:%02d", time->tm_hour, time->tm_min, time->tm_sec);
-  len = strlen(message);
-
-  if (XineramaIsActive(dpy)) {
-    xsi = XineramaQueryScreens(dpy, &i);
-    s_width = xsi[0].width;
-    s_height = xsi[0].height;
-  } else {
-    s_width = DisplayWidth(dpy, lock->screen);
-    s_height = DisplayHeight(dpy, lock->screen);
-  }
-
-  height = s_height / 2;
-  width  = (s_width - XTextWidth(fontinfo, message, len)) / 2;
-
-  XDrawString(dpy, lock->win, gc, width, height, message, len);
-
-  /* xsi should not be NULL anyway if Xinerama is active, but to be safe */
-  if (XineramaIsActive(dpy) && xsi != NULL)
-    XFree(xsi);
+  XMapRaised(dpy, lock->win);
+  XPutImage(dpy, lock->win, gc, lock->image, 0, 0, 0, 0, lock->image->width, lock->image->height);
 
   XFlush(dpy);
   XFreeGC(dpy, gc);
-}
-
-static void *
-updatetime(void *args)
-{
-  struct TimeThreadParams *params = (struct TimeThreadParams *) args;
-
-  time_t rawtime;
-
-  // for pthread_cond_timedwait
-  struct timespec timeout;
-  clock_gettime(CLOCK_MONOTONIC, &timeout);
-
-  XEvent e;
-
-  pthread_mutex_lock(params->mutex);
-
-  while (!params->exit) {
-    timeout.tv_sec += 1;
-
-    // get current time
-    time(&rawtime);
-    localtime_r(&rawtime, params->current_time);
-
-    // send Expose event
-    memset(&e, 0, sizeof(XEvent));
-    e.type = Expose;
-    e.xexpose.window = params->lock->win;
-    XSendEvent(params->dpy, params->lock->win, 0, ExposureMask, &e);
-    XFlush(params->dpy);
-
-    // sleep for 1 second
-    pthread_cond_timedwait(params->cond, params->mutex, &timeout);
-  }
-
-  pthread_mutex_unlock(params->mutex);
-  pthread_exit(NULL);
 }
 
 static void
@@ -311,34 +231,6 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
   running = 1;
   oldc = INIT;
 
-  // display time with updates every second on main monitor
-  XSelectInput(dpy, locks[0]->win, KeyPressMask | ExposureMask);
-
-  struct tm *current_time = malloc(sizeof(struct tm));
-
-  pthread_mutex_t mutex;
-  pthread_mutex_init(&mutex, NULL);
-
-  pthread_cond_t cond;
-  pthread_condattr_t condattr;
-  pthread_condattr_init(&condattr);
-  pthread_condattr_setclock(&condattr, CLOCK_MONOTONIC);
-  pthread_cond_init(&cond, &condattr);
-
-  struct TimeThreadParams *ttparams = malloc(sizeof(struct TimeThreadParams));
-  ttparams->dpy = dpy;
-  ttparams->lock = locks[0];
-  ttparams->mutex = &mutex;
-  ttparams->cond = &cond;
-  ttparams->current_time = current_time;
-  ttparams->exit = 0;
-
-  pthread_t time_thread;
-  pthread_create(&time_thread, NULL, updatetime, ttparams);
-
-  for (screen = 0; screen < nscreens; screen++)
-    displayimagetime(dpy, locks[screen], current_time);
-
   while (running && !XNextEvent(dpy, &ev)) {
     failure = 0;
 
@@ -393,12 +285,10 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
       if (running && oldc != color) {
         for (screen = 0; screen < nscreens; screen++) {
           blurlockwindow(dpy, locks[screen], color);
-          displayimagetime(dpy, locks[screen], current_time);
+          displayimage(dpy, locks[screen]);
         }
         oldc = color;
       }
-    } else if (ev.type == Expose) {
-      displayimagetime(dpy, locks[0], current_time);
     } else if (rr->active && ev.type == rr->evbase + RRScreenChangeNotify) {
       rre = (XRRScreenChangeNotifyEvent*)&ev;
       for (screen = 0; screen < nscreens; screen++) {
@@ -411,7 +301,7 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
             XResizeWindow(dpy, locks[screen]->win,
                           rre->width, rre->height);
           blurlockwindow(dpy, locks[screen], INIT);
-          displayimagetime(dpy, locks[screen], current_time);
+          displayimage(dpy, locks[screen]);
           XClearWindow(dpy, locks[screen]->win);
           break;
         }
@@ -421,13 +311,6 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
         XRaiseWindow(dpy, locks[screen]->win);
     }
   }
-
-  ttparams->exit = 1;
-  pthread_cond_signal(ttparams->cond);
-  pthread_join(time_thread, NULL);
-
-  free(current_time);
-  free(ttparams);
 }
 
 static struct lock *
@@ -469,13 +352,19 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 
   XWindowAttributes attr;
   XGetWindowAttributes(dpy, lock->root, &attr);
-  lock->originalimage = XGetImage(dpy, lock->root, attr.x, attr.y, attr.width, attr.height, AllPlanes, ZPixmap);
+  lock->originalimage = XGetImage(dpy, lock->root, 0, 0, attr.width, attr.height, AllPlanes, ZPixmap);
   stackblur(lock->originalimage, 0, 0, lock->originalimage->width, lock->originalimage->height, blurradius, CPU_THREADS);
 
   lock->image = malloc(sizeof(XImage));
   memcpy(lock->image, lock->originalimage, sizeof(XImage));
   lock->image->data = malloc(sizeof(char) * lock->image->bytes_per_line * lock->image->height);
+
   blurlockwindow(dpy, lock, INIT);
+  displayimage(dpy, lock);
+
+  // For some reason, I need to put this here twice, otherwise it
+  // doesn't render correctly the first time
+  displayimage(dpy, lock);
 
   /* Try to grab mouse pointer *and* keyboard for 600ms, else fail the lock */
   for (i = 0, ptgrab = kbgrab = -1; i < 6; i++) {
@@ -629,6 +518,7 @@ main(int argc, char **argv) {
 
   /* reset DPMS values to inital ones */
   DPMSSetTimeouts(dpy, standby, suspend, off);
+  DPMSDisable(dpy);
   XSync(dpy, 0);
 
   return 0;
