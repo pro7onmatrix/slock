@@ -231,6 +231,10 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
   running = 1;
   oldc = INIT;
 
+  XNextEvent(dpy, &ev);
+  for (screen = 0; screen < nscreens; screen++)
+    displayimage(dpy, locks[screen]);
+
   while (running && !XNextEvent(dpy, &ev)) {
     failure = 0;
 
@@ -360,11 +364,6 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
   lock->image->data = malloc(sizeof(char) * lock->image->bytes_per_line * lock->image->height);
 
   blurlockwindow(dpy, lock, INIT);
-  displayimage(dpy, lock);
-
-  // For some reason, I need to put this here twice, otherwise it
-  // doesn't render correctly the first time
-  displayimage(dpy, lock);
 
   /* Try to grab mouse pointer *and* keyboard for 600ms, else fail the lock */
   for (i = 0, ptgrab = kbgrab = -1; i < 6; i++) {

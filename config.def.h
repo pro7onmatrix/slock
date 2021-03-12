@@ -17,7 +17,6 @@ static const int monitortime = 300;
 /* allow control key to trigger fail on clear */
 static const int controlkeyclear = 0;
 
-
-static const int blurradius = 30;
+static const int blurradius = 15;
 
 #define CPU_THREADS 4
