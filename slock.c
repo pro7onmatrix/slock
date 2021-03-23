@@ -359,10 +359,7 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
   lock->originalimage = XGetImage(dpy, lock->root, 0, 0, attr.width, attr.height, AllPlanes, ZPixmap);
   stackblur(lock->originalimage, 0, 0, lock->originalimage->width, lock->originalimage->height, blurradius, CPU_THREADS);
 
-  lock->image = malloc(sizeof(XImage));
-  memcpy(lock->image, lock->originalimage, sizeof(XImage));
-  lock->image->data = malloc(sizeof(char) * lock->image->bytes_per_line * lock->image->height);
-
+  lock->image = XGetImage(dpy, lock->root, 0, 0, attr.width, attr.height, AllPlanes, ZPixmap);
   blurlockwindow(dpy, lock, INIT);
 
   /* Try to grab mouse pointer *and* keyboard for 600ms, else fail the lock */
